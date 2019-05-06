@@ -6,6 +6,8 @@ Original project: https://github.com/damieng/setledsmac
 
 This command-line tool lets you set your keyboard LEDs. This is especially useful if you have a back-lit keyboard and don't want scroll lock, number lock or caps lock to remain unlit.
 
+### Unlike many other solutions, this does not require you to install any third party utilities to manipulate or capture keystrokes. The utility built from this project runs standalone as a LaunchDaemon at login time and handles numlock, scrlck, and capslock LEDs.
+
 ## Note
 Setting the LED on or off does not affect the behavior of that key so even though the led for caps lock will be on caps lock itself will still be off. Tapping the key will cause the lock to come on but the LED will already be on so it will not appear to change. Tapping it again will turn it off (and cause the LED to turn off).
 
