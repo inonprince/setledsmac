@@ -6,7 +6,7 @@
 	<string>com.rajiteh.setleds</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/setleds</string>
+		<string>%%BINARYPATH%%</string>
 		<string>monitor</string>
 	</array>
 	<key>RunAtLoad</key>
