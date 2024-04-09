@@ -1,16 +1,15 @@
 
-/*  setleds for Mac
- https://github.com/damieng/setledsmac
- Copyright 2015-2017 Damien Guard. GPL 2 licenced.
-
- Monitor mode added by Raj Perera - https://github.com/rajiteh/setledsmac-monitor
- Keyboard event sniffer code is from https://github.com/objective-see/sniffMK
+/* syncleds for MacOS
+ based on work by damieng and rajiteh
+ GPL 2 licenced.
  */
 
 #include "main.h"
 
 Boolean verbose = false;
 const char * nameMatch;
+int kbMatch;
+int tbMatch;
 static CFMachPortRef eventTap = NULL;
 
 IOHIDManagerRef manager;
@@ -29,7 +28,7 @@ void current_timestamp() {
 
 int main(int argc, const char * argv[])
 {
-    printf("SetLEDs version 0.2 + Monitor - Based on https://github.com/damieng/setledsmac\n");
+    printf("Starting SyncLeds\n");
     parseOptions(argc, argv);
     printf("\n");
     return 0;
@@ -42,10 +41,11 @@ void parseOptions(int argc, const char * argv[])
         explainUsage();
         exit(1);
     }
-    
-    
-    
+
     Boolean nextIsName = false;
+    Boolean nextIsKb = false;
+    Boolean nextIsTb = false;
+
     Boolean monitorMode = false;
     
     LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
@@ -57,6 +57,10 @@ void parseOptions(int argc, const char * argv[])
             verbose = true;
         else if(strcasecmp(argv[i], "-name") == 0)
             nextIsName = true;
+        else if(strcasecmp(argv[i], "-kb") == 0)
+            nextIsKb = true;
+        else if(strcasecmp(argv[i], "-tb") == 0)
+            nextIsTb = true;
         
         // Numeric lock
         else if (strcasecmp(argv[i], "+num") == 0)
@@ -87,7 +91,14 @@ void parseOptions(int argc, const char * argv[])
                 nameMatch = argv[i];
                 nextIsName = false;
             }
-            else {
+            else if (nextIsTb) {
+                tbMatch = (int)strtol(argv[i], NULL, 16);
+                nextIsTb = false;
+            }
+            else if (nextIsKb) {
+                kbMatch = (int)strtol(argv[i], NULL, 16);
+                nextIsKb = false;
+            } else {
                 fprintf(stderr, "Unknown option %s\n\n", argv[i]);
                 explainUsage();
                 exit(1);
@@ -107,8 +118,13 @@ void parseOptions(int argc, const char * argv[])
         return;
     }
     IOHIDManagerSetDeviceMatching(manager, keyboard);
-    devices = IOHIDManagerCopyDevices(manager);
-    getRefs();
+    IOHIDManagerRegisterDeviceMatchingCallback(manager, device_add_callback, NULL);
+//    IOHIDManagerRegisterDeviceRemovalCallback(manager, device_remove_callback, NULL);
+    IOHIDManagerScheduleWithRunLoop(
+          manager,
+          CFRunLoopGetMain(),
+          kCFRunLoopDefaultMode
+       );
     
     if (monitorMode)
         startMonitor();
@@ -169,6 +185,45 @@ bail:
     
 }
 
+static void device_add_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
+
+     if (isKeyboardDevice(ref)) {
+        CFStringRef deviceIdRef = IOHIDDeviceGetProperty(ref, CFSTR(kIOHIDProductIDKey));
+        if (!deviceIdRef) return;
+        uint deviceId = 0;
+        CFTypeID numericTypeId = CFNumberGetTypeID();
+        if (deviceIdRef && CFGetTypeID(deviceIdRef) == numericTypeId) {
+            CFNumberGetValue((CFNumberRef)deviceIdRef, kCFNumberSInt32Type, &deviceId);
+        }
+        if (deviceId == tbMatch) {
+            printf("ball found\n");
+            tbDevice = (IOHIDDeviceRef)CFRetain(ref);
+        }
+        if (deviceId == kbMatch) {
+            printf("keeb found\n");
+            kbDevice = (IOHIDDeviceRef)CFRetain(ref);
+        }
+    }
+}
+//
+//static void device_remove_callback(
+//   void *context,
+//   IOReturn result,
+//   void *sender,
+//   IOHIDDeviceRef ref
+//) {
+//    current_timestamp();
+//}
+
+
 //callback for mouse/keyboard events
 CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
@@ -189,13 +244,13 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
                 changes[kHIDUsage_LED_CapsLock] = Toggle;
                 setKeyboard(tbDevice, keyboard, changes);
                 break;
-            case 0x47:
+            case 0x68: //this is KC_LNG1. use 0x47 for KC_NUM_LOCK
                 changes[kHIDUsage_LED_NumLock] = Toggle;
-                setKeyboard(tbDevice, keyboard, changes);
+                setKeyboard(kbDevice, keyboard, changes);
                 break;
             case 0x6b:
                 changes[kHIDUsage_LED_ScrollLock] = Toggle;
-                setKeyboard(kbDevice, keyboard, changes);
+                setKeyboard(tbDevice, keyboard, changes);
                 break;
             default:
                 return event;
@@ -209,13 +264,14 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
 
 void explainUsage()
 {
-    printf("Usage:\tsetleds [monitor] [-v] [-name wildcard] [[+|-|^][ num | caps | scroll]]\n"
+    printf("Usage:\tsetleds [monitor] [-v] [-name wildcard]  [-kb num]  [-tb num] [[+|-|^][ num | caps | scroll]]\n"
            "Thus,\tsetleds +caps -num ^scroll\n"
            "will set CapsLock, clear NumLock and toggle ScrollLock.\n"
            "Any leds changed are reported for each keyboard.\n"
            "Specify -v to shows state of all leds.\n"
            "Specify -name to match keyboard name with a wildcard\n"
-           "Use the \"monitor\" sub command to run continously and toggle LEDs on keypress.");
+           "Use the \"monitor\" sub command to run continously and toggle LEDs on keypress.\n"
+           "Specify \"-kb [num] -tb [num]\" to sync QMK keeb and trackball. Get \"Product ID\" values from \"System Information\"\n");
 }
 
 Boolean isKeyboardDevice(IOHIDDeviceRef device)
@@ -225,28 +281,6 @@ Boolean isKeyboardDevice(IOHIDDeviceRef device)
 
 void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedState changes[])
 {
-//    CFStringRef deviceNameRef = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductKey));
-//    if (!deviceNameRef) return;
-//    
-//    CFStringRef deviceIdRef = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductIDKey));
-//    if (!deviceIdRef) return;
-//    
-//    const char * deviceName = CFStringGetCStringPtr(deviceNameRef, kCFStringEncodingUTF8);
-//    if (nameMatch && fnmatch(nameMatch, deviceName, 0) != 0)
-//        return;
-//    uint productId = 0;
-//    CFTypeID numericTypeId = CFNumberGetTypeID();
-//    if (deviceIdRef && CFGetTypeID(deviceIdRef) == numericTypeId) {
-//        CFNumberGetValue((CFNumberRef)deviceIdRef, kCFNumberSInt32Type, &productId);
-//    }
-//    
-//    if (changes[kHIDUsage_LED_ScrollLock] != NoChange) {
-//        if (productId != 24926) return;
-//    } else {
-//        if (productId != 21667) return;
-//    }
-//    printf("\nDeviceid: \"%s\" (%d)", deviceName, productId);
-
     IOHIDDeviceOpen(device, 0);
 
     CFArrayRef elements = IOHIDDeviceCopyMatchingElements(device, keyboardDictionary, kIOHIDOptionsTypeNone);
@@ -271,7 +305,6 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
                 } else {
                     long current = IOHIDValueGetIntegerValue(currentValue);
                     CFRelease(CFRetain(currentValue));
-//                    CFRelease(currentValue);
 
                     // Should we try to set the led?
                     if (changes[led] != NoChange && changes[led] != current) {
@@ -279,29 +312,11 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
                         if (newState == Toggle) {
                             newState = current == 0 ? On : Off;
                         }
-//                        LedState newState2 = changes[led];
-//                        if (newState == Toggle) {
-//                            newState2 = current == 0 ? Off : On;
-//                        }
+
                         IOHIDValueRef newValue = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, element, 0, newState);
                         if (newValue) {
                             // IOReturn changeResult = IOHIDDeviceSetValue(device, element, newValue);
-
                             IOHIDDeviceSetValue(device, element, newValue);
-
-                            current_timestamp();
-//                            usleep(100*1000);
-//                            IOHIDValueRef newValue2 = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, element, 0, newState2);
-//                            IOHIDDeviceSetValue(device, element, newValue2);
-//                            current_timestamp();
-//                            CFRelease(newValue2);
-
-
-                            // Was the change successful?
-                            // if (kIOReturnSuccess == changeResult) {
-                            //    printf("%s%s ", stateSymbol[newState], ledNames[led - 1]);
-                            // }
-
                             CFRelease(newValue);
                         }
                     } else if (verbose) {
@@ -335,57 +350,9 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
     }
 }
 
-void getRefs()
-{
-    if (devices) {
-        CFIndex deviceCount = CFSetGetCount(devices);
-        if (deviceCount == 0) {
-            fprintf(stderr, "ERROR: Could not find any keyboard devices.\n");
-        }
-        else {
-            // Loop through all keyboards attempting to get or display led state
-            IOHIDDeviceRef *deviceRefs = malloc(sizeof(IOHIDDeviceRef) * deviceCount);
-            if (deviceRefs) {
-                CFSetGetValues(devices, (const void **) deviceRefs);
-                for (CFIndex deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++)
-                    if (isKeyboardDevice(deviceRefs[deviceIndex])) {
-                        CFStringRef deviceIdRef = IOHIDDeviceGetProperty(deviceRefs[deviceIndex], CFSTR(kIOHIDProductIDKey));
-                        if (!deviceIdRef) return;
-                        uint deviceId = 0;
-                        CFTypeID numericTypeId = CFNumberGetTypeID();
-                        if (deviceIdRef && CFGetTypeID(deviceIdRef) == numericTypeId) {
-                            CFNumberGetValue((CFNumberRef)deviceIdRef, kCFNumberSInt32Type, &deviceId);
-                        }
-                        if (deviceId == 21667) {
-                            printf("nano found");
-                            tbDevice = (IOHIDDeviceRef)CFRetain(deviceRefs[deviceIndex]);
-                        }
-                        if (deviceId == 24926) {
-                            printf("corne found");
-                            kbDevice = (IOHIDDeviceRef)CFRetain(deviceRefs[deviceIndex]);
-                        }
-                    }
-
-//                free(deviceRefs);
-            }
-        }
-        
-//        CFRelease(devices);
-    }
-    
-//    CFRelease(keyboard);
-}
-
 void setAllKeyboards(LedState changes[])
 {
-    printf("casax\n");
-    current_timestamp();
-    
-    
-    printf("ueuuu\n");
-    current_timestamp();
-    printf("uTTeuuu\n");
-    current_timestamp();
+    CFSetRef devices = IOHIDManagerCopyDevices(manager);
     if (devices) {
         CFIndex deviceCount = CFSetGetCount(devices);
         if (deviceCount == 0) {
@@ -398,7 +365,6 @@ void setAllKeyboards(LedState changes[])
                 CFSetGetValues(devices, (const void **) deviceRefs);
                 for (CFIndex deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++)
                     if (isKeyboardDevice(deviceRefs[deviceIndex])) {
-                        current_timestamp();
                         setKeyboard(deviceRefs[deviceIndex], keyboard, changes);
                     }
 
@@ -406,10 +372,10 @@ void setAllKeyboards(LedState changes[])
             }
         }
         
-//        CFRelease(devices);
+        CFRelease(devices);
     }
     
-//    CFRelease(keyboard);
+    CFRelease(keyboard);
 }
 
 CFMutableDictionaryRef getKeyboardDictionary()

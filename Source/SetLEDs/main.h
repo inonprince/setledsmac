@@ -19,10 +19,12 @@ typedef enum { NoChange = -1, Off, On, Toggle } LedState;
 void parseOptions(int argc, const char * argv[]);
 void explainUsage(void);
 void startMonitor(void);
-void getRefs(void);
 void setAllKeyboards(LedState changes[]);
 void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedState changes[]);
 CFMutableDictionaryRef getKeyboardDictionary(void);
 CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
-
+static void device_add_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
+//static void device_remove_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
+Boolean isKeyboardDevice(IOHIDDeviceRef device);
 #endif
+
