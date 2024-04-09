@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.inonio.setleds</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%%BINARYPATH%%</string>
+		<string>monitor</string>
+		<string>-kb</string>
+		<string>0x615e</string>
+		<string>-tb</string>
+		<string>0x54a3</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/setleds.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/setleds.stderr</string>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>
