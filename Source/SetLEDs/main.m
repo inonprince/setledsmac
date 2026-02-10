@@ -28,6 +28,8 @@ void current_timestamp() {
 
 int main(int argc, const char * argv[])
 {
+    setlinebuf(stdout);
+    setlinebuf(stderr);
     printf("Starting SyncLeds\n");
     parseOptions(argc, argv);
     printf("\n");
@@ -119,6 +121,7 @@ void parseOptions(int argc, const char * argv[])
     }
     IOHIDManagerSetDeviceMatching(manager, keyboard);
     IOHIDManagerRegisterDeviceMatchingCallback(manager, device_add_callback, NULL);
+    IOHIDManagerRegisterInputValueCallback(manager, joystickAction, NULL);
 //    IOHIDManagerRegisterDeviceRemovalCallback(manager, device_remove_callback, NULL);
     IOHIDManagerScheduleWithRunLoop(
           manager,
@@ -147,8 +150,8 @@ void startMonitor()
     
 //        eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, eventMask, eventCallback, NULL);
         eventTap = CGEventTapCreate(kCGHIDEventTap,
-                                    kCGTailAppendEventTap,
-                                    kCGEventTapOptionListenOnly,
+                                    kCGHeadInsertEventTap, // kCGTailAppendEventTap,
+                                    kCGEventTapOptionDefault, // kCGEventTapOptionListenOnly,
                                     eventMask, eventCallback, NULL);
         if(NULL == eventTap)
         {
@@ -185,6 +188,8 @@ bail:
     
 }
 
+void joystickAction(void* inContext, IOReturn inResult, void* inSender, IOHIDValueRef value) {
+}
 static void device_add_callback(
    void *context,
    IOReturn result,
@@ -237,6 +242,7 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
     keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     if(kCGEventKeyUp == type || (kCGEventFlagsChanged == type && keyCode == 0x39))
     {
+
         LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
         switch (keyCode)
         {
@@ -244,7 +250,7 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
                 changes[kHIDUsage_LED_CapsLock] = Toggle;
                 setKeyboard(tbDevice, keyboard, changes);
                 break;
-            case 0x68: //this is KC_LNG1. use 0x47 for KC_NUM_LOCK
+            case 0x5e: // KC_INTERNATIONAL_1 . use 0x47 for num lock
                 changes[kHIDUsage_LED_NumLock] = Toggle;
                 setKeyboard(kbDevice, keyboard, changes);
                 break;
@@ -256,8 +262,10 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
                 return event;
                 
         }
-//       setAllKeyboards(changes);
-  
+    }
+    // swallowing numlock keypresses
+    if (keyCode == 0x5e) {
+        return nil;
     }
     return event;
 }
@@ -301,7 +309,6 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
                 
                 if (currentValue == 0x00) {
                     missingState = true;
-                    // printf("?%s ", ledNames[led - 1]);
                 } else {
                     long current = IOHIDValueGetIntegerValue(currentValue);
                     CFRelease(CFRetain(currentValue));
@@ -315,7 +322,6 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
 
                         IOHIDValueRef newValue = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, element, 0, newState);
                         if (newValue) {
-                            // IOReturn changeResult = IOHIDDeviceSetValue(device, element, newValue);
                             IOHIDDeviceSetValue(device, element, newValue);
                             CFRelease(newValue);
                         }
@@ -400,3 +406,27 @@ CFMutableDictionaryRef getKeyboardDictionary()
     }
     return result;
 }
+
+CFMutableDictionaryRef getJoystickDictionary()
+{
+    CFMutableDictionaryRef result = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    
+    if (!result) return result;
+    
+    UInt32 inUsagePage = kHIDPage_GenericDesktop;
+    UInt32 inUsage = kHIDUsage_GD_Joystick;
+    
+    CFNumberRef page = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &inUsagePage);
+    if (page) {
+        CFDictionarySetValue(result, CFSTR(kIOHIDDeviceUsageKey), page);
+        CFRelease(page);
+        
+        CFNumberRef usage = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &inUsage);
+        if (usage) {
+            CFDictionarySetValue(result, CFSTR(kIOHIDDeviceUsageKey), usage);
+            CFRelease(usage);
+        }
+    }
+    return result;
+}
+

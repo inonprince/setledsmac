@@ -9,7 +9,7 @@
 		<string>%%BINARYPATH%%</string>
 		<string>monitor</string>
 		<string>-kb</string>
-		<string>0x615e</string>
+		<string>0x27db</string>
 		<string>-tb</string>
 		<string>0x54a3</string>
 	</array>
