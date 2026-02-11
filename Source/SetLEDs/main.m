@@ -240,6 +240,7 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
     }
     CGKeyCode keyCode = 0;
     keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+
     if(kCGEventKeyUp == type || (kCGEventFlagsChanged == type && keyCode == 0x39))
     {
 
@@ -250,21 +251,25 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
                 changes[kHIDUsage_LED_CapsLock] = Toggle;
                 setKeyboard(tbDevice, keyboard, changes);
                 break;
-            case 0x5e: // KC_INTERNATIONAL_1 . use 0x47 for num lock
-                changes[kHIDUsage_LED_NumLock] = Toggle;
+            case 0x5e: // KC_INTERNATIONAL_1 - trackball movement start
+                changes[kHIDUsage_LED_ScrollLock] = On;
                 setKeyboard(kbDevice, keyboard, changes);
                 break;
-            case 0x6b:
+            case 0x68: // KC_LANG1 - trackball movement stop
+                changes[kHIDUsage_LED_ScrollLock] = Off;
+                setKeyboard(kbDevice, keyboard, changes);
+                break;
+            case 0x47: // KP_NLCK - command from keyboard to trackball
                 changes[kHIDUsage_LED_ScrollLock] = Toggle;
                 setKeyboard(tbDevice, keyboard, changes);
                 break;
             default:
                 return event;
-                
+
         }
     }
-    // swallowing numlock keypresses
-    if (keyCode == 0x5e) {
+    // swallow trackball keypresses and keyboard commands
+    if (keyCode == 0x5e || keyCode == 0x68 || keyCode == 0x47) {
         return nil;
     }
     return event;
@@ -314,7 +319,7 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
                     CFRelease(CFRetain(currentValue));
 
                     // Should we try to set the led?
-                    if (changes[led] != NoChange && changes[led] != current) {
+                    if (changes[led] != NoChange) {
                         LedState newState = changes[led];
                         if (newState == Toggle) {
                             newState = current == 0 ? On : Off;
