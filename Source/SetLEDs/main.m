@@ -18,6 +18,8 @@ CFSetRef devices;
 
 IOHIDDeviceRef tbDevice;
 IOHIDDeviceRef kbDevice;
+IOHIDDeviceRef vendorDevice;
+static IOHIDManagerRef vendor_manager = NULL;
 
 static AutomouseMode automouse_mode = MODE_TRACKBALL_SIGNALED;
 static bool automouse_active = false;
@@ -38,6 +40,14 @@ void current_timestamp() {
     gettimeofday(&te, NULL); // get current time
     long long milliseconds = te.tv_sec*1000LL + te.tv_usec/1000; // calculate milliseconds
     printf("milliseconds: %lld\n", milliseconds);
+}
+
+void send_feature_report(IOHIDDeviceRef device, bool active) {
+    uint8_t report[] = { 0x01, active ? 0x04 : 0x00 };  // Report ID 1, ScrollLock bit
+    IOReturn ret = IOHIDDeviceSetReport(
+        device, kIOHIDReportTypeFeature, 0x01, report, sizeof(report));
+    if (verbose) printf("Feature report: automouse=%s (ret=0x%x)\n",
+                        active ? "ON" : "OFF", ret);
 }
 
 int main(int argc, const char * argv[])
@@ -158,6 +168,34 @@ void parseOptions(int argc, const char * argv[])
           kCFRunLoopDefaultMode
        );
     
+    // Set up vendor HID manager for feature report channel (bypasses KVM)
+    if (kbMatch && automouse_mode == MODE_OS_MONITORED) {
+        vendor_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+        if (vendor_manager) {
+            IOHIDManagerOpen(vendor_manager, kIOHIDOptionsTypeNone);
+
+            // Match vendor-defined usage page (0xFF00) with the keyboard's vendor ID
+            UInt32 vendorPage = 0xFF00;
+            UInt32 vendorUsage = 0x01;
+            CFMutableDictionaryRef vendorDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef vp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorPage);
+            CFNumberRef vu = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorUsage);
+            CFDictionarySetValue(vendorDict, CFSTR(kIOHIDDeviceUsagePageKey), vp);
+            CFDictionarySetValue(vendorDict, CFSTR(kIOHIDDeviceUsageKey), vu);
+            CFRelease(vp); CFRelease(vu);
+
+            IOHIDManagerSetDeviceMatching(vendor_manager, vendorDict);
+            CFRelease(vendorDict);
+
+            IOHIDManagerRegisterDeviceMatchingCallback(vendor_manager, vendor_device_add_callback, NULL);
+            IOHIDManagerRegisterDeviceRemovalCallback(vendor_manager, vendor_device_remove_callback, NULL);
+            IOHIDManagerScheduleWithRunLoop(vendor_manager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
+            if (verbose) printf("Vendor HID manager initialized for feature report channel\n");
+        }
+    }
+
     // Set up blacklist monitoring for pointing devices
     if (blacklist_count > 0 && automouse_mode == MODE_OS_MONITORED) {
         pointing_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
@@ -314,16 +352,57 @@ static void device_remove_callback(
         printf("keeb removed\n");
         CFRelease(kbDevice);
         kbDevice = NULL;
-        // Cancel any pending automouse timeout since we can't send to the device
-        if (mouse_idle_timer != NULL) {
-            CFRunLoopTimerInvalidate(mouse_idle_timer);
-            CFRelease(mouse_idle_timer);
-            mouse_idle_timer = NULL;
+        // Cancel any pending automouse timeout if no vendor device either
+        if (!vendorDevice) {
+            if (mouse_idle_timer != NULL) {
+                CFRunLoopTimerInvalidate(mouse_idle_timer);
+                CFRelease(mouse_idle_timer);
+                mouse_idle_timer = NULL;
+            }
+            automouse_active = false;
         }
-        automouse_active = false;
     }
 }
 
+
+static void vendor_device_add_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
+
+    CFNumberRef pidRef = IOHIDDeviceGetProperty(ref, CFSTR(kIOHIDProductIDKey));
+    if (!pidRef || CFGetTypeID(pidRef) != CFNumberGetTypeID()) return;
+
+    uint deviceId = 0;
+    CFNumberGetValue((CFNumberRef)pidRef, kCFNumberSInt32Type, &deviceId);
+
+    if (deviceId == kbMatch) {
+        printf("vendor HID device found (PID 0x%x)\n", deviceId);
+        vendorDevice = (IOHIDDeviceRef)CFRetain(ref);
+    }
+}
+
+static void vendor_device_remove_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
+
+    if (ref == vendorDevice) {
+        printf("vendor HID device removed\n");
+        CFRelease(vendorDevice);
+        vendorDevice = NULL;
+    }
+}
 
 static void blacklisted_input_callback(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
     last_blacklisted_input = CFAbsoluteTimeGetCurrent();
@@ -347,15 +426,19 @@ static void pointing_device_added(void *context, IOReturn result, void *sender, 
 
 void mouse_idle_timeout(CFRunLoopTimerRef timer, void *info)
 {
-    if (!kbDevice) return;
-    if (verbose) printf("Mouse idle timeout — sending ScrollLock OFF\n");
+    if (!vendorDevice && !kbDevice) return;
+    if (verbose) printf("Mouse idle timeout — sending automouse OFF\n");
     automouse_active = false;
 
-    dispatch_async(led_queue, ^{
-        LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
-        changes[kHIDUsage_LED_ScrollLock] = Off;
-        setKeyboard(kbDevice, keyboard, changes);
-    });
+    if (vendorDevice) {
+        send_feature_report(vendorDevice, false);
+    } else {
+        dispatch_async(led_queue, ^{
+            LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
+            changes[kHIDUsage_LED_ScrollLock] = Off;
+            setKeyboard(kbDevice, keyboard, changes);
+        });
+    }
 
     // Non-repeating timer is invalidated after firing; release and null
     // so the next mouse movement creates a fresh timer
@@ -382,7 +465,7 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
         int64_t sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
         if (sourcePid != 0) return event;
 
-        if (!kbDevice) return event;
+        if (!vendorDevice && !kbDevice) return event;
 
         // Skip if a blacklisted device recently sent HID input
         if (blacklist_count > 0 &&
@@ -391,13 +474,17 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
         }
 
         if (!automouse_active) {
-            if (verbose) printf("Mouse movement detected — sending ScrollLock ON\n");
+            if (verbose) printf("Mouse movement detected — sending automouse ON\n");
             automouse_active = true;
-            dispatch_async(led_queue, ^{
-                LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
-                changes[kHIDUsage_LED_ScrollLock] = On;
-                setKeyboard(kbDevice, keyboard, changes);
-            });
+            if (vendorDevice) {
+                send_feature_report(vendorDevice, true);
+            } else {
+                dispatch_async(led_queue, ^{
+                    LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
+                    changes[kHIDUsage_LED_ScrollLock] = On;
+                    setKeyboard(kbDevice, keyboard, changes);
+                });
+            }
         }
 
         // Create or reset the idle timer

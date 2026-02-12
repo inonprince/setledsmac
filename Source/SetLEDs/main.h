@@ -22,12 +22,15 @@ void explainUsage(void);
 void startMonitor(void);
 void setAllKeyboards(LedState changes[]);
 void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedState changes[]);
+void send_feature_report(IOHIDDeviceRef device, bool active);
 CFMutableDictionaryRef getJoystickDictionary(void);
 CFMutableDictionaryRef getKeyboardDictionary(void);
 CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
 void mouse_idle_timeout(CFRunLoopTimerRef timer, void *info);
 static void device_add_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
 static void device_remove_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
+static void vendor_device_add_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
+static void vendor_device_remove_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
 void joystickAction(void* inContext, IOReturn inResult, void* inSender, IOHIDValueRef value);
 
 Boolean isKeyboardDevice(IOHIDDeviceRef device);
