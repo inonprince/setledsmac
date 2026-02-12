@@ -505,9 +505,6 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
         return event; // never swallow mouse events
     }
 
-    // In OS mode, no trackball-specific keyboard handling — Nano is just a pointer
-    if (automouse_mode == MODE_OS_MONITORED) return event;
-
     CGKeyCode keyCode = 0;
     keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
 
@@ -522,10 +519,12 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
                 setKeyboard(tbDevice, keyboard, changes);
                 break;
             case 0x5e: // KC_INTERNATIONAL_1 - trackball movement start
+                if (automouse_mode == MODE_OS_MONITORED) break;
                 changes[kHIDUsage_LED_ScrollLock] = On;
                 setKeyboard(kbDevice, keyboard, changes);
                 break;
             case 0x68: // KC_LANG1 - trackball movement stop
+                if (automouse_mode == MODE_OS_MONITORED) break;
                 changes[kHIDUsage_LED_ScrollLock] = Off;
                 setKeyboard(kbDevice, keyboard, changes);
                 break;
@@ -538,8 +537,11 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
 
         }
     }
-    // swallow trackball keypresses and keyboard commands
-    if (keyCode == 0x5e || keyCode == 0x68 || keyCode == 0x47) {
+    // Swallow keyboard-to-trackball commands; in OS mode let INT1/LANG1 pass through
+    if (keyCode == 0x47) {
+        return nil;
+    }
+    if (automouse_mode != MODE_OS_MONITORED && (keyCode == 0x5e || keyCode == 0x68)) {
         return nil;
     }
     return event;
