@@ -15,6 +15,7 @@ const int maxLeds = 3;
 const char* ledNames[] = { "num", "caps", "scroll" };
 const char* stateSymbol[] = {"-", "+" };
 typedef enum { NoChange = -1, Off, On, Toggle } LedState;
+typedef enum { MODE_TRACKBALL_SIGNALED, MODE_OS_MONITORED } AutomouseMode;
 
 void parseOptions(int argc, const char * argv[]);
 void explainUsage(void);
@@ -24,8 +25,9 @@ void setKeyboard(IOHIDDeviceRef device, CFDictionaryRef keyboardDictionary, LedS
 CFMutableDictionaryRef getJoystickDictionary(void);
 CFMutableDictionaryRef getKeyboardDictionary(void);
 CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
+void mouse_idle_timeout(CFRunLoopTimerRef timer, void *info);
 static void device_add_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
-//static void device_remove_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
+static void device_remove_callback(void* context, IOReturn result, void* sender, IOHIDDeviceRef device);
 void joystickAction(void* inContext, IOReturn inResult, void* inSender, IOHIDValueRef value);
 
 Boolean isKeyboardDevice(IOHIDDeviceRef device);

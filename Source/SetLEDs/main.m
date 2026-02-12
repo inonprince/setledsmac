@@ -19,6 +19,20 @@ CFSetRef devices;
 IOHIDDeviceRef tbDevice;
 IOHIDDeviceRef kbDevice;
 
+static AutomouseMode automouse_mode = MODE_TRACKBALL_SIGNALED;
+static bool automouse_active = false;
+static CFRunLoopTimerRef mouse_idle_timer = NULL;
+static const CFTimeInterval MOUSE_IDLE_TIMEOUT = 0.45; // 450ms
+static dispatch_queue_t led_queue = NULL; // serial queue for async LED I/O
+
+static void pointing_device_added(void *context, IOReturn result, void *sender, IOHIDDeviceRef device);
+
+static int blacklist_pids[16];
+static int blacklist_count = 0;
+static CFAbsoluteTime last_blacklisted_input = 0;
+static IOHIDManagerRef pointing_manager = NULL;
+static const CFAbsoluteTime BLACKLIST_WINDOW = 0.015; // 15ms correlation window
+
 void current_timestamp() {
     struct timeval te;
     gettimeofday(&te, NULL); // get current time
@@ -47,6 +61,7 @@ void parseOptions(int argc, const char * argv[])
     Boolean nextIsName = false;
     Boolean nextIsKb = false;
     Boolean nextIsTb = false;
+    Boolean nextIsBlacklist = false;
 
     Boolean monitorMode = false;
     
@@ -63,6 +78,10 @@ void parseOptions(int argc, const char * argv[])
             nextIsKb = true;
         else if(strcasecmp(argv[i], "-tb") == 0)
             nextIsTb = true;
+        else if(strcasecmp(argv[i], "-os") == 0)
+            automouse_mode = MODE_OS_MONITORED;
+        else if(strcasecmp(argv[i], "-blacklist") == 0)
+            nextIsBlacklist = true;
         
         // Numeric lock
         else if (strcasecmp(argv[i], "+num") == 0)
@@ -100,6 +119,16 @@ void parseOptions(int argc, const char * argv[])
             else if (nextIsKb) {
                 kbMatch = (int)strtol(argv[i], NULL, 16);
                 nextIsKb = false;
+            }
+            else if (nextIsBlacklist) {
+                char *str = strdup(argv[i]);
+                char *token = strtok(str, ",");
+                while (token && blacklist_count < 16) {
+                    blacklist_pids[blacklist_count++] = (int)strtol(token, NULL, 16);
+                    token = strtok(NULL, ",");
+                }
+                free(str);
+                nextIsBlacklist = false;
             } else {
                 fprintf(stderr, "Unknown option %s\n\n", argv[i]);
                 explainUsage();
@@ -122,13 +151,58 @@ void parseOptions(int argc, const char * argv[])
     IOHIDManagerSetDeviceMatching(manager, keyboard);
     IOHIDManagerRegisterDeviceMatchingCallback(manager, device_add_callback, NULL);
     IOHIDManagerRegisterInputValueCallback(manager, joystickAction, NULL);
-//    IOHIDManagerRegisterDeviceRemovalCallback(manager, device_remove_callback, NULL);
+    IOHIDManagerRegisterDeviceRemovalCallback(manager, device_remove_callback, NULL);
     IOHIDManagerScheduleWithRunLoop(
           manager,
           CFRunLoopGetMain(),
           kCFRunLoopDefaultMode
        );
     
+    // Set up blacklist monitoring for pointing devices
+    if (blacklist_count > 0 && automouse_mode == MODE_OS_MONITORED) {
+        pointing_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+        if (pointing_manager) {
+            IOHIDManagerOpen(pointing_manager, kIOHIDOptionsTypeNone);
+
+            UInt32 gdPage = kHIDPage_GenericDesktop;
+            UInt32 mouseUsage = kHIDUsage_GD_Mouse;
+            UInt32 ptrUsage = kHIDUsage_GD_Pointer;
+
+            CFMutableDictionaryRef mouseDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef mp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &gdPage);
+            CFNumberRef mu = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &mouseUsage);
+            CFDictionarySetValue(mouseDict, CFSTR(kIOHIDDeviceUsagePageKey), mp);
+            CFDictionarySetValue(mouseDict, CFSTR(kIOHIDDeviceUsageKey), mu);
+            CFRelease(mp); CFRelease(mu);
+
+            CFMutableDictionaryRef ptrDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef pp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &gdPage);
+            CFNumberRef pu = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &ptrUsage);
+            CFDictionarySetValue(ptrDict, CFSTR(kIOHIDDeviceUsagePageKey), pp);
+            CFDictionarySetValue(ptrDict, CFSTR(kIOHIDDeviceUsageKey), pu);
+            CFRelease(pp); CFRelease(pu);
+
+            CFDictionaryRef matchDicts[] = { mouseDict, ptrDict };
+            CFArrayRef matchArray = CFArrayCreate(kCFAllocatorDefault,
+                (const void **)matchDicts, 2, &kCFTypeArrayCallBacks);
+            CFRelease(mouseDict); CFRelease(ptrDict);
+
+            IOHIDManagerSetDeviceMatchingMultiple(pointing_manager, matchArray);
+            CFRelease(matchArray);
+
+            IOHIDManagerRegisterDeviceMatchingCallback(pointing_manager, pointing_device_added, NULL);
+            IOHIDManagerScheduleWithRunLoop(pointing_manager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
+            if (verbose) {
+                printf("Blacklist active for %d device(s):", blacklist_count);
+                for (int i = 0; i < blacklist_count; i++) printf(" 0x%x", blacklist_pids[i]);
+                printf("\n");
+            }
+        }
+    }
+
     if (monitorMode)
         startMonitor();
     else
@@ -142,11 +216,14 @@ void startMonitor()
     CFRunLoopSourceRef runLoopSource = NULL;
     
     printf("Starting in monitor mode.\n");
-    
+    led_queue = dispatch_queue_create("org.inonio.setleds.led", DISPATCH_QUEUE_SERIAL);
+
     @autoreleasepool {
-        //init event mask with mouse events
-        // ->add 'CGEventMaskBit(kCGEventMouseMoved)' for mouse move events
         eventMask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventFlagsChanged);
+        if (automouse_mode == MODE_OS_MONITORED) {
+            eventMask |= CGEventMaskBit(kCGEventMouseMoved);
+            printf("OS-monitored automouse enabled.\n");
+        }
     
 //        eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, eventMask, eventCallback, NULL);
         eventTap = CGEventTapCreate(kCGHIDEventTap,
@@ -218,16 +295,76 @@ static void device_add_callback(
         }
     }
 }
-//
-//static void device_remove_callback(
-//   void *context,
-//   IOReturn result,
-//   void *sender,
-//   IOHIDDeviceRef ref
-//) {
-//    current_timestamp();
-//}
+static void device_remove_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
 
+    if (ref == tbDevice) {
+        printf("ball removed\n");
+        CFRelease(tbDevice);
+        tbDevice = NULL;
+    }
+    if (ref == kbDevice) {
+        printf("keeb removed\n");
+        CFRelease(kbDevice);
+        kbDevice = NULL;
+        // Cancel any pending automouse timeout since we can't send to the device
+        if (mouse_idle_timer != NULL) {
+            CFRunLoopTimerInvalidate(mouse_idle_timer);
+            CFRelease(mouse_idle_timer);
+            mouse_idle_timer = NULL;
+        }
+        automouse_active = false;
+    }
+}
+
+
+static void blacklisted_input_callback(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
+    last_blacklisted_input = CFAbsoluteTimeGetCurrent();
+}
+
+static void pointing_device_added(void *context, IOReturn result, void *sender, IOHIDDeviceRef device) {
+    CFNumberRef pidRef = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductIDKey));
+    if (!pidRef || CFGetTypeID(pidRef) != CFNumberGetTypeID()) return;
+
+    int pid = 0;
+    CFNumberGetValue(pidRef, kCFNumberSInt32Type, &pid);
+
+    for (int i = 0; i < blacklist_count; i++) {
+        if (pid == blacklist_pids[i]) {
+            if (verbose) printf("Blacklisted pointing device matched: 0x%x\n", pid);
+            IOHIDDeviceRegisterInputValueCallback(device, blacklisted_input_callback, NULL);
+            return;
+        }
+    }
+}
+
+void mouse_idle_timeout(CFRunLoopTimerRef timer, void *info)
+{
+    if (!kbDevice) return;
+    if (verbose) printf("Mouse idle timeout — sending ScrollLock OFF\n");
+    automouse_active = false;
+
+    dispatch_async(led_queue, ^{
+        LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
+        changes[kHIDUsage_LED_ScrollLock] = Off;
+        setKeyboard(kbDevice, keyboard, changes);
+    });
+
+    // Non-repeating timer is invalidated after firing; release and null
+    // so the next mouse movement creates a fresh timer
+    if (mouse_idle_timer != NULL) {
+        CFRunLoopTimerInvalidate(mouse_idle_timer);
+        CFRelease(mouse_idle_timer);
+        mouse_idle_timer = NULL;
+    }
+}
 
 //callback for mouse/keyboard events
 CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
@@ -238,6 +375,52 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
         fprintf(stderr, "Event tap timed out: restarting tap");
         return event;
     }
+
+    // OS-monitored automouse: detect physical cursor movement
+    if (kCGEventMouseMoved == type && automouse_mode == MODE_OS_MONITORED) {
+        // Filter out programmatic mouse movement (scripts, AppleScript, etc.)
+        int64_t sourcePid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID);
+        if (sourcePid != 0) return event;
+
+        if (!kbDevice) return event;
+
+        // Skip if a blacklisted device recently sent HID input
+        if (blacklist_count > 0 &&
+            (CFAbsoluteTimeGetCurrent() - last_blacklisted_input) < BLACKLIST_WINDOW) {
+            return event;
+        }
+
+        if (!automouse_active) {
+            if (verbose) printf("Mouse movement detected — sending ScrollLock ON\n");
+            automouse_active = true;
+            dispatch_async(led_queue, ^{
+                LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
+                changes[kHIDUsage_LED_ScrollLock] = On;
+                setKeyboard(kbDevice, keyboard, changes);
+            });
+        }
+
+        // Create or reset the idle timer
+        if (mouse_idle_timer == NULL) {
+            mouse_idle_timer = CFRunLoopTimerCreate(
+                kCFAllocatorDefault,
+                CFAbsoluteTimeGetCurrent() + MOUSE_IDLE_TIMEOUT,
+                0, // non-repeating
+                0, 0,
+                mouse_idle_timeout,
+                NULL
+            );
+            CFRunLoopAddTimer(CFRunLoopGetCurrent(), mouse_idle_timer, kCFRunLoopCommonModes);
+        } else {
+            CFRunLoopTimerSetNextFireDate(mouse_idle_timer, CFAbsoluteTimeGetCurrent() + MOUSE_IDLE_TIMEOUT);
+        }
+
+        return event; // never swallow mouse events
+    }
+
+    // In OS mode, no trackball-specific keyboard handling — Nano is just a pointer
+    if (automouse_mode == MODE_OS_MONITORED) return event;
+
     CGKeyCode keyCode = 0;
     keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
 
@@ -277,14 +460,18 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
 
 void explainUsage()
 {
-    printf("Usage:\tsetleds [monitor] [-v] [-name wildcard]  [-kb num]  [-tb num] [[+|-|^][ num | caps | scroll]]\n"
+    printf("Usage:\tsetleds [monitor] [-v] [-name wildcard]  [-kb num]  [-tb num] [-os] [-blacklist pid,...] [[+|-|^][ num | caps | scroll]]\n"
            "Thus,\tsetleds +caps -num ^scroll\n"
            "will set CapsLock, clear NumLock and toggle ScrollLock.\n"
            "Any leds changed are reported for each keyboard.\n"
            "Specify -v to shows state of all leds.\n"
            "Specify -name to match keyboard name with a wildcard\n"
            "Use the \"monitor\" sub command to run continously and toggle LEDs on keypress.\n"
-           "Specify \"-kb [num] -tb [num]\" to sync QMK keeb and trackball. Get \"Product ID\" values from \"System Information\"\n");
+           "Specify \"-kb [num] -tb [num]\" to sync QMK keeb and trackball. Get \"Product ID\" values from \"System Information\"\n"
+           "Specify -os for OS-level automouse detection (cursor movement from any device triggers automouse).\n"
+           "  Without -os, automouse relies on trackball firmware signals (default).\n"
+           "Specify -blacklist with comma-separated hex Product IDs to exclude devices from triggering automouse.\n"
+           "  e.g. -blacklist 0x1234,0x5678. Use with -os. Magic Trackpad is unaffected (not a HID mouse).\n");
 }
 
 Boolean isKeyboardDevice(IOHIDDeviceRef device)
