@@ -600,6 +600,9 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
             case 0x66: // LANG2 → cycle DPI (keydown only)
                 if (is_down) send_raw_hid_command(tbRawHidDevice, 0x07);
                 return nil;
+            case 0x5a: // F20 → reset to bootloader (keydown only)
+                if (is_down) send_raw_hid_command(tbRawHidDevice, 0x08);
+                return nil;
         }
     }
 
