@@ -19,7 +19,9 @@ CFSetRef devices;
 IOHIDDeviceRef tbDevice;
 IOHIDDeviceRef kbDevice;
 IOHIDDeviceRef vendorDevice;
+IOHIDDeviceRef tbRawHidDevice;
 static IOHIDManagerRef vendor_manager = NULL;
+static IOHIDManagerRef tb_raw_hid_manager = NULL;
 
 static AutomouseMode automouse_mode = MODE_TRACKBALL_SIGNALED;
 static bool automouse_active = false;
@@ -48,6 +50,14 @@ void send_feature_report(IOHIDDeviceRef device, bool active) {
         device, kIOHIDReportTypeFeature, 0x01, report, sizeof(report));
     if (verbose) printf("Feature report: automouse=%s (ret=0x%x)\n",
                         active ? "ON" : "OFF", ret);
+}
+
+void send_raw_hid_command(IOHIDDeviceRef device, uint8_t command) {
+    uint8_t report[32] = {0};
+    report[0] = command;
+    IOReturn ret = IOHIDDeviceSetReport(
+        device, kIOHIDReportTypeOutput, 0, report, sizeof(report));
+    if (verbose) printf("Raw HID command 0x%02x to trackball (ret=0x%x)\n", command, ret);
 }
 
 int main(int argc, const char * argv[])
@@ -193,6 +203,33 @@ void parseOptions(int argc, const char * argv[])
             IOHIDManagerScheduleWithRunLoop(vendor_manager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
 
             if (verbose) printf("Vendor HID manager initialized for feature report channel\n");
+        }
+    }
+
+    // Set up Raw HID manager for trackball command channel (Usage Page 0xFF60)
+    if (tbMatch) {
+        tb_raw_hid_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+        if (tb_raw_hid_manager) {
+            IOHIDManagerOpen(tb_raw_hid_manager, kIOHIDOptionsTypeNone);
+
+            UInt32 rawHidPage = 0xFF60;
+            UInt32 rawHidUsage = 0x61;
+            CFMutableDictionaryRef rawHidDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef rhp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &rawHidPage);
+            CFNumberRef rhu = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &rawHidUsage);
+            CFDictionarySetValue(rawHidDict, CFSTR(kIOHIDDeviceUsagePageKey), rhp);
+            CFDictionarySetValue(rawHidDict, CFSTR(kIOHIDDeviceUsageKey), rhu);
+            CFRelease(rhp); CFRelease(rhu);
+
+            IOHIDManagerSetDeviceMatching(tb_raw_hid_manager, rawHidDict);
+            CFRelease(rawHidDict);
+
+            IOHIDManagerRegisterDeviceMatchingCallback(tb_raw_hid_manager, tb_raw_hid_add_callback, NULL);
+            IOHIDManagerRegisterDeviceRemovalCallback(tb_raw_hid_manager, tb_raw_hid_remove_callback, NULL);
+            IOHIDManagerScheduleWithRunLoop(tb_raw_hid_manager, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
+            if (verbose) printf("Trackball Raw HID manager initialized for command channel\n");
         }
     }
 
@@ -404,6 +441,45 @@ static void vendor_device_remove_callback(
     }
 }
 
+static void tb_raw_hid_add_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
+
+    CFNumberRef pidRef = IOHIDDeviceGetProperty(ref, CFSTR(kIOHIDProductIDKey));
+    if (!pidRef || CFGetTypeID(pidRef) != CFNumberGetTypeID()) return;
+
+    uint deviceId = 0;
+    CFNumberGetValue((CFNumberRef)pidRef, kCFNumberSInt32Type, &deviceId);
+
+    if (deviceId == tbMatch) {
+        printf("trackball Raw HID device found (PID 0x%x)\n", deviceId);
+        tbRawHidDevice = (IOHIDDeviceRef)CFRetain(ref);
+    }
+}
+
+static void tb_raw_hid_remove_callback(
+   void *context,
+   IOReturn result,
+   void *sender,
+   IOHIDDeviceRef ref
+) {
+   (void)context;
+   (void)result;
+   (void)sender;
+
+    if (ref == tbRawHidDevice) {
+        printf("trackball Raw HID device removed\n");
+        CFRelease(tbRawHidDevice);
+        tbRawHidDevice = NULL;
+    }
+}
+
 static void blacklisted_input_callback(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
     last_blacklisted_input = CFAbsoluteTimeGetCurrent();
 }
@@ -508,42 +584,25 @@ CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eve
     CGKeyCode keyCode = 0;
     keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
 
-    if(kCGEventKeyUp == type || (kCGEventFlagsChanged == type && keyCode == 0x39))
-    {
-
-        LedState changes[] = { NoChange, NoChange, NoChange, NoChange };
-        switch (keyCode)
-        {
-            case 0x39:
-                changes[kHIDUsage_LED_CapsLock] = Toggle;
-                setKeyboard(tbDevice, keyboard, changes);
-                break;
-            case 0x5e: // KC_INTERNATIONAL_1 - trackball movement start
-                if (automouse_mode == MODE_OS_MONITORED) break;
-                changes[kHIDUsage_LED_ScrollLock] = On;
-                setKeyboard(kbDevice, keyboard, changes);
-                break;
-            case 0x68: // KC_LANG1 - trackball movement stop
-                if (automouse_mode == MODE_OS_MONITORED) break;
-                changes[kHIDUsage_LED_ScrollLock] = Off;
-                setKeyboard(kbDevice, keyboard, changes);
-                break;
-            case 0x47: // KP_NLCK - command from keyboard to trackball
-                changes[kHIDUsage_LED_ScrollLock] = Toggle;
-                setKeyboard(tbDevice, keyboard, changes);
-                break;
-            default:
-                return event;
-
+    // Raw HID commands to trackball — keydown = ON, keyup = OFF
+    if ((kCGEventKeyDown == type || kCGEventKeyUp == type) && tbRawHidDevice) {
+        bool is_down = (kCGEventKeyDown == type);
+        switch (keyCode) {
+            case 0x5e: // INTERNATIONAL_1 → scroll
+                send_raw_hid_command(tbRawHidDevice, is_down ? 0x01 : 0x02);
+                return nil;
+            case 0x5d: // INTERNATIONAL_3 → snipe
+                send_raw_hid_command(tbRawHidDevice, is_down ? 0x03 : 0x04);
+                return nil;
+            case 0x68: // LANG1 → warp
+                send_raw_hid_command(tbRawHidDevice, is_down ? 0x05 : 0x06);
+                return nil;
+            case 0x66: // LANG2 → cycle DPI (keydown only)
+                if (is_down) send_raw_hid_command(tbRawHidDevice, 0x07);
+                return nil;
         }
     }
-    // Swallow keyboard-to-trackball commands; in OS mode let INT1/LANG1 pass through
-    if (keyCode == 0x47) {
-        return nil;
-    }
-    if (automouse_mode != MODE_OS_MONITORED && (keyCode == 0x5e || keyCode == 0x68)) {
-        return nil;
-    }
+
     return event;
 }
 
